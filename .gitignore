@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Hugging Face / cache
+.cache/
+hf_cache/
+
+# Outputs
+outputs/raw/*.jsonl
+outputs/tables/*.csv
+outputs/tables/*.md
+outputs/images/*
+!outputs/raw/.gitkeep
+!outputs/tables/.gitkeep
+!outputs/images/.gitkeep
+
+# Misc
+.DS_Store
+*.log
