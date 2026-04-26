@@ -24,6 +24,10 @@ from src.utils.seed_utils import set_seed
 
 VALID_CONDITIONS = ["original", "black", "no_image", "patchshuffle_16"]
 
+PROMPT_INSTRUCTION = (
+    "If you cannot answer from the image, say 'unknown' or describe what is wrong with the image."
+)
+
 
 def build_prompt(question: str) -> str:
     """
@@ -31,10 +35,10 @@ def build_prompt(question: str) -> str:
 
     Current experiment prompt:
         {question}
-        Answer with a single word or short phrase.
+        If you cannot answer from the image, say 'unknown' or describe what is wrong with the image.
     """
     question = str(question).strip()
-    return f"{question}\nAnswer with a single word or short phrase."
+    return f"{question}\n{PROMPT_INSTRUCTION}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -126,13 +130,17 @@ def make_output_path(
     image_size: int,
     patch_size: int,
 ) -> Path:
-    safe_dataset = dataset_repo.replace("/", "_").replace("-", "_")
-    safe_split = split.replace("/", "_").replace("-", "_")
+    """
+    Return a clean output filename for the current experiment.
 
-    return Path(output_dir) / (
-        f"qwen_slake_{safe_dataset}_{safe_split}_shortphrase_"
-        f"mnt{max_new_tokens}_img{image_size}_patch{patch_size}.jsonl"
-    )
+    Current experiment:
+    - Dataset: SLAKE
+    - Split: test
+    - Conditions: original / black / no_image / patchshuffle_16
+    - Prompt: unknown-or-describe
+    - max_new_tokens: 128
+    """
+    return Path(output_dir) / "slake_qwen_unknown_prompt.jsonl"
 
 
 def normalize_for_key(x: Any) -> str:
@@ -145,17 +153,8 @@ def make_unique_sample_key(sample: Any) -> str:
     """
     Unique key for avoiding duplicated output rows.
 
-    Important:
-    This key should identify the dataset sample, NOT the content.
-
-    We should NOT deduplicate by question/answer text, because SLAKE can contain
-    many different samples with the same question-answer pair.
-
-    For the test split, this usually becomes:
-        test::{sample_id}
-
-    If image_id exists, we also include it:
-        test::{sample_id}::{image_id}
+    This identifies the dataset sample, not the question-answer content.
+    Therefore, repeated question-answer pairs are preserved.
     """
     split = normalize_for_key(sample.split)
     sample_id = normalize_for_key(sample.sample_id)
@@ -173,8 +172,6 @@ def collect_samples(ds_all: Any, split: str) -> list[tuple[str, int, Any]]:
 
     For this experiment, use:
         --split test
-
-    split == 'all' is kept for flexibility, but not recommended for the current run.
     """
     items: list[tuple[str, int, Any]] = []
 
@@ -215,7 +212,7 @@ def build_row_base(
         "sample_id": sample.sample_id,
         "question": sample.question,
         "input_prompt": input_prompt,
-        "prompt": "Answer with a single word or short phrase.",
+        "prompt_instruction": PROMPT_INSTRUCTION,
         "gt_answer": sample.answer,
         "pred_answer": None,
         "image_size": args.image_size,
@@ -288,7 +285,7 @@ def main() -> None:
                 "sample_id": str(idx),
                 "question": None,
                 "input_prompt": None,
-                "prompt": "Answer with a single word or short phrase.",
+                "prompt_instruction": PROMPT_INSTRUCTION,
                 "gt_answer": None,
                 "pred_answer": None,
                 "image_size": args.image_size,
@@ -314,7 +311,7 @@ def main() -> None:
 
     print(f"[INFO] Unique dataset samples to run: {len(samples)}")
     print(f"[INFO] Conditions: {args.conditions}")
-    print("[INFO] Prompt: Answer with a single word or short phrase.")
+    print(f"[INFO] Prompt instruction: {PROMPT_INSTRUCTION}")
     print(f"[INFO] Max new tokens: {args.max_new_tokens}")
     print(f"[INFO] Output: {output_path}")
 
