@@ -31,15 +31,38 @@ def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
     return rows
 
 
-def get_completed_keys(path: str | Path) -> set[tuple[str, str]]:
-    """Return (condition, sample_id) pairs already present in a JSONL file."""
-    completed: set[tuple[str, str]] = set()
-    for row in read_jsonl(path):
-        condition = str(row.get("condition", ""))
-        sample_id = str(row.get("sample_id", ""))
-        if condition and sample_id:
-            completed.add((condition, sample_id))
-    return completed
+def get_completed_keys(path):
+    """
+    Return completed keys for resume.
+
+    Prefer unique_sample_key if available. Fall back to sample_id.
+    """
+    import json
+    from pathlib import Path
+
+    path = Path(path)
+    if not path.exists():
+        return set()
+
+    keys = set()
+
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            condition = row.get("condition")
+            sample_key = row.get("unique_sample_key", row.get("sample_id"))
+
+            if condition is not None and sample_key is not None:
+                keys.add((condition, str(sample_key)))
+
+    return keys
 
 
 def save_text(path: str | Path, text: str) -> None:

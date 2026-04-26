@@ -6,6 +6,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+from datasets import DatasetDict
 from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -13,33 +14,27 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from src.datasets.load_slake import extract_slake_sample, get_split, load_slake_dataset
 from src.models.qwen_vl import Qwen25VLWrapper, QwenVLConfig
-from src.utils.image_utils import make_black_image, resize_image
+from src.utils.image_utils import (
+    make_black_image,
+    make_patchshuffle_image,
+    resize_image,
+)
 from src.utils.io_utils import append_jsonl, ensure_dir, get_completed_keys
 from src.utils.seed_utils import set_seed
 
-VALID_CONDITIONS = ["original", "black", "text_only"]
-VALID_PROMPT_STYLES = ["raw", "one_word"]
+VALID_CONDITIONS = ["original", "black", "no_image", "patchshuffle_16"]
 
 
-def build_prompt(question: str, prompt_style: str) -> str:
+def build_prompt(question: str) -> str:
     """
     Build the exact user text sent to Qwen.
 
-    raw:
-        Use the dataset question as-is.
-
-    one_word:
-        Add a minimal answer-format instruction.
+    Current experiment prompt:
+        {question}
+        Answer with a single word or short phrase.
     """
     question = str(question).strip()
-
-    if prompt_style == "raw":
-        return question
-
-    if prompt_style == "one_word":
-        return f"{question}\nAnswer in one word."
-
-    raise ValueError(f"Unknown prompt_style: {prompt_style}")
+    return f"{question}\nAnswer with a single word or short phrase."
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,6 +54,7 @@ def parse_args() -> argparse.Namespace:
         "--split",
         type=str,
         default="test",
+        help="Dataset split. Use 'test' for the full test split.",
     )
     parser.add_argument(
         "--conditions",
@@ -70,28 +66,23 @@ def parse_args() -> argparse.Namespace:
         "--num_samples",
         type=int,
         default=None,
-        help="Number of samples to run. Default: all samples.",
+        help="Number of samples to run. Default: all samples in the selected split.",
     )
     parser.add_argument(
         "--max_new_tokens",
         type=int,
-        default=16,
-    )
-    parser.add_argument(
-        "--prompt_style",
-        type=str,
-        default="one_word",
-        choices=VALID_PROMPT_STYLES,
-        help=(
-            "Prompt style. "
-            "raw: use the dataset question only. "
-            "one_word: append 'Answer in one word.'"
-        ),
+        default=128,
     )
     parser.add_argument(
         "--image_size",
         type=int,
         default=512,
+    )
+    parser.add_argument(
+        "--patch_size",
+        type=int,
+        default=16,
+        help="Patch size for patchshuffle condition.",
     )
     parser.add_argument(
         "--output_dir",
@@ -111,7 +102,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Skip completed (condition, sample_id) rows.",
+        help="Skip completed (condition, unique_sample_key) rows.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite output file before running. Recommended for a fresh full run.",
     )
     parser.add_argument(
         "--save_images",
@@ -127,12 +123,80 @@ def make_output_path(
     dataset_repo: str,
     split: str,
     max_new_tokens: int,
-    prompt_style: str,
+    image_size: int,
+    patch_size: int,
 ) -> Path:
     safe_dataset = dataset_repo.replace("/", "_").replace("-", "_")
+    safe_split = split.replace("/", "_").replace("-", "_")
+
     return Path(output_dir) / (
-        f"qwen_slake_{safe_dataset}_{split}_{prompt_style}_mnt{max_new_tokens}.jsonl"
+        f"qwen_slake_{safe_dataset}_{safe_split}_shortphrase_"
+        f"mnt{max_new_tokens}_img{image_size}_patch{patch_size}.jsonl"
     )
+
+
+def normalize_for_key(x: Any) -> str:
+    if x is None:
+        return ""
+    return str(x).strip()
+
+
+def make_unique_sample_key(sample: Any) -> str:
+    """
+    Unique key for avoiding duplicated output rows.
+
+    Important:
+    This key should identify the dataset sample, NOT the content.
+
+    We should NOT deduplicate by question/answer text, because SLAKE can contain
+    many different samples with the same question-answer pair.
+
+    For the test split, this usually becomes:
+        test::{sample_id}
+
+    If image_id exists, we also include it:
+        test::{sample_id}::{image_id}
+    """
+    split = normalize_for_key(sample.split)
+    sample_id = normalize_for_key(sample.sample_id)
+    image_id = normalize_for_key(sample.image_id)
+
+    if image_id:
+        return f"{split}::{sample_id}::{image_id}"
+
+    return f"{split}::{sample_id}"
+
+
+def collect_samples(ds_all: Any, split: str) -> list[tuple[str, int, Any]]:
+    """
+    Return list of (split_name, idx, raw_sample).
+
+    For this experiment, use:
+        --split test
+
+    split == 'all' is kept for flexibility, but not recommended for the current run.
+    """
+    items: list[tuple[str, int, Any]] = []
+
+    if split == "all":
+        if isinstance(ds_all, DatasetDict):
+            split_names = list(ds_all.keys())
+            print(f"[INFO] Running all splits: {split_names}")
+
+            for split_name in split_names:
+                ds = ds_all[split_name]
+                for idx in range(len(ds)):
+                    items.append((split_name, idx, ds[idx]))
+        else:
+            print("[WARN] Dataset is not DatasetDict. Treating it as a single split.")
+            for idx in range(len(ds_all)):
+                items.append(("all", idx, ds_all[idx]))
+    else:
+        ds = get_split(ds_all, split)
+        for idx in range(len(ds)):
+            items.append((split, idx, ds[idx]))
+
+    return items
 
 
 def build_row_base(
@@ -140,19 +204,22 @@ def build_row_base(
     args: argparse.Namespace,
     condition: str,
     sample: Any,
+    unique_sample_key: str,
     input_prompt: str,
 ) -> dict[str, Any]:
     return {
         "model_name": args.model_name,
         "dataset": args.dataset_repo,
         "condition": condition,
+        "unique_sample_key": unique_sample_key,
         "sample_id": sample.sample_id,
         "question": sample.question,
         "input_prompt": input_prompt,
-        "prompt_style": args.prompt_style,
+        "prompt": "Answer with a single word or short phrase.",
         "gt_answer": sample.answer,
         "pred_answer": None,
         "image_size": args.image_size,
+        "patch_size": args.patch_size if condition == "patchshuffle_16" else None,
         "max_new_tokens": args.max_new_tokens,
         "do_sample": False,
         "temperature": 0.0,
@@ -164,9 +231,10 @@ def build_row_base(
     }
 
 
-def save_debug_image(image: Any, condition: str, sample_id: str) -> str:
+def save_debug_image(image: Any, condition: str, sample_key: str) -> str:
     image_dir = ensure_dir(REPO_ROOT / "outputs" / "images" / condition)
-    path = image_dir / f"{sample_id}.png"
+    safe_sample_key = str(sample_key).replace("/", "_").replace(":", "_")
+    path = image_dir / f"{safe_sample_key}.png"
     image.save(path)
     return str(path)
 
@@ -180,22 +248,74 @@ def main() -> None:
         dataset_repo=args.dataset_repo,
         split=args.split,
         max_new_tokens=args.max_new_tokens,
-        prompt_style=args.prompt_style,
+        image_size=args.image_size,
+        patch_size=args.patch_size,
     )
     ensure_dir(output_path.parent)
+
+    if args.overwrite and output_path.exists():
+        print(f"[INFO] Removing existing output file: {output_path}")
+        output_path.unlink()
 
     completed = get_completed_keys(output_path) if args.resume else set()
 
     print(f"[INFO] Loading dataset: {args.dataset_repo}")
     ds_all = load_slake_dataset(args.dataset_repo, split=None)
-    ds = get_split(ds_all, args.split)
 
-    total = len(ds) if args.num_samples is None else min(args.num_samples, len(ds))
+    raw_items = collect_samples(ds_all, args.split)
+    print(f"[INFO] Raw samples found: {len(raw_items)}")
 
-    print(f"[INFO] Split: {args.split}")
-    print(f"[INFO] Total samples to visit: {total}")
+    samples = []
+    seen_sample_keys = set()
+
+    for split_name, idx, raw_sample in raw_items:
+        try:
+            sample = extract_slake_sample(raw_sample, idx=idx, split=split_name)
+            unique_sample_key = make_unique_sample_key(sample)
+
+            if unique_sample_key in seen_sample_keys:
+                continue
+
+            seen_sample_keys.add(unique_sample_key)
+            samples.append(sample)
+
+        except Exception as exc:
+            error_row = {
+                "model_name": args.model_name,
+                "dataset": args.dataset_repo,
+                "condition": "extract_error",
+                "unique_sample_key": f"{split_name}::{idx}",
+                "sample_id": str(idx),
+                "question": None,
+                "input_prompt": None,
+                "prompt": "Answer with a single word or short phrase.",
+                "gt_answer": None,
+                "pred_answer": None,
+                "image_size": args.image_size,
+                "patch_size": None,
+                "max_new_tokens": args.max_new_tokens,
+                "do_sample": False,
+                "temperature": 0.0,
+                "random_seed": args.random_seed,
+                "split": split_name,
+                "image_id": None,
+                "raw_sample_keys": list(raw_sample.keys())
+                if isinstance(raw_sample, dict)
+                else None,
+                "error": repr(exc),
+                "traceback": traceback.format_exc(),
+            }
+
+            if not args.dry_run:
+                append_jsonl(output_path, error_row)
+
+    if args.num_samples is not None:
+        samples = samples[: args.num_samples]
+
+    print(f"[INFO] Unique dataset samples to run: {len(samples)}")
     print(f"[INFO] Conditions: {args.conditions}")
-    print(f"[INFO] Prompt style: {args.prompt_style}")
+    print("[INFO] Prompt: Answer with a single word or short phrase.")
+    print(f"[INFO] Max new tokens: {args.max_new_tokens}")
     print(f"[INFO] Output: {output_path}")
 
     model = None
@@ -205,43 +325,14 @@ def main() -> None:
     else:
         print("[DRY RUN] Model will not be loaded. Rows will not be written.")
 
-    for idx in tqdm(range(total), desc="SLAKE inference"):
-        raw_sample = ds[idx]
+    for sample in tqdm(samples, desc="SLAKE inference"):
+        unique_sample_key = make_unique_sample_key(sample)
+        input_prompt = build_prompt(sample.question)
 
-        try:
-            sample = extract_slake_sample(raw_sample, idx=idx, split=args.split)
-        except Exception as exc:
-            error_row = {
-                "model_name": args.model_name,
-                "dataset": args.dataset_repo,
-                "condition": "extract_error",
-                "sample_id": str(idx),
-                "question": None,
-                "input_prompt": None,
-                "prompt_style": args.prompt_style,
-                "gt_answer": None,
-                "pred_answer": None,
-                "image_size": args.image_size,
-                "max_new_tokens": args.max_new_tokens,
-                "do_sample": False,
-                "temperature": 0.0,
-                "random_seed": args.random_seed,
-                "split": args.split,
-                "image_id": None,
-                "raw_sample_keys": list(raw_sample.keys())
-                if isinstance(raw_sample, dict)
-                else None,
-                "error": repr(exc),
-                "traceback": traceback.format_exc(),
-            }
-            append_jsonl(output_path, error_row)
-            continue
-
-        input_prompt = build_prompt(sample.question, args.prompt_style)
-
-        if args.dry_run and idx < 3:
+        if args.dry_run:
             print("\n[DRY RUN SAMPLE]")
-            print(f"idx={idx}")
+            print(f"unique_sample_key={unique_sample_key}")
+            print(f"split={sample.split}")
             print(f"sample_id={sample.sample_id}")
             print(f"image_id={sample.image_id}")
             print(f"question={sample.question}")
@@ -251,19 +342,23 @@ def main() -> None:
             continue
 
         for condition in args.conditions:
-            if args.resume and (condition, sample.sample_id) in completed:
+            completed_key = (condition, unique_sample_key)
+
+            if args.resume and completed_key in completed:
                 continue
 
             row = build_row_base(
                 args=args,
                 condition=condition,
                 sample=sample,
+                unique_sample_key=unique_sample_key,
                 input_prompt=input_prompt,
             )
 
             try:
-                if condition == "text_only":
+                if condition == "no_image":
                     input_image = None
+
                 else:
                     if sample.image is None:
                         raise ValueError(
@@ -274,8 +369,17 @@ def main() -> None:
 
                     if condition == "original":
                         input_image = resized
+
                     elif condition == "black":
                         input_image = make_black_image(resized)
+
+                    elif condition == "patchshuffle_16":
+                        input_image = make_patchshuffle_image(
+                            resized,
+                            patch_size=args.patch_size,
+                            seed=args.random_seed,
+                        )
+
                     else:
                         raise ValueError(f"Unknown condition: {condition}")
 
@@ -283,7 +387,7 @@ def main() -> None:
                         row["saved_image_path"] = save_debug_image(
                             image=input_image,
                             condition=condition,
-                            sample_id=sample.sample_id,
+                            sample_key=unique_sample_key,
                         )
 
                 assert model is not None
